@@ -1,0 +1,12 @@
+[package]
+authors = ["anas"]
+edition = "2018"
+name = "uno-rs"
+version = "0.1.0"
+
+[dependencies]
+libp2p = "^0.28.1"
+tokio = { version = "^0.2", features = ["full"] }
+async-std = "^1.6.2"
+env_logger = "^0.7.1"
+futures = "0.3.1"
