@@ -64,13 +64,195 @@ struct Message {
     text: String,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // chat();
-    gui()
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Path of our program
+    // cfg : Get user info (username, address)
+
+    // make the channels
+    // mpsc : multiple producers, single reciever
+    // broadcast : multiple produces, single reciever
+    // async-channel : specialized broadcast
+
+    // Network
+    // Make the peer_id
+    // set up transport
+
+    // create the extended swarm
+    // OPTIONAL: To make sure that the same thing doesn't be sent twice there is a thing
+
+    // build config
+    // gossipsub::GossipsubConfigBuilder::new()
+    // .heartbeat_interval(Duration::from_secs(10))
+    // .message_id_fn(message_id_fn)
+    // .build();
+
+    // build the behavior
+    // gossipsub::Gossipsub::new(MessageAuthenticity::Signed(local_key), config);
+    // subscribe to topic
+    // gossipsub.sub(topic.clone());
+    // libp2p::Swarm::new(transport, gossipsub, local_peer_id)
+    // listen on whatever the OS assigns
+    // libp2p::Swarm::listen_on(&mut Swarm, "/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
+
+    // Connect to a node if specified
+    // if let Some(to_dial) = cfg.get_network() {
+    // let dialing = to_dial.clone();
+    // match to_dial.parse() {
+    // libp2p::Swarm::dial_addr(&mut swarm, to_dial)
+
+    // thread that listens for messages to send
+    // tokio::spawn
+    // swarm.publish(&topic, serde_json::to_string(&m).unwrap().as_bytes())
+
+    // thread that listens for messages to recieve
+    // swarm.poll_next_unpin or whatever
+
+    // GUI
+
+    let cfg = config::prompt();
+
+    // struct NetworkWorker
+    // username
+    // topics
+    // peer id
+    // swarm
+
+    let network = NetworkWorker::new(cfg.get_user())
+        .subscribe("topic-test")
+        .subscribe("general")
+        .listen("/ip4/0.0.0.0/tcp/0")
+        .build();
+
+    network.dial(cfg.get_network()).await?;
+
+    let service = network.service();
+
+    tokio::spawn(async move {
+        while let Ok(m) = net_reciever.recv().await? {
+            service.publish(m).await?;
+        }
+    });
+
+    let service = network.service();
+
+    tokio::spawn(async move {
+        while let Some(m) = service.next().await? {
+            msg_sender.send(m);
+        }
+    });
+
+    Ok(())
+}
+
+fn chat() -> Result<(), Box<dyn Error>> {
+    Builder::from_env(Env::default().default_filter_or("info")).init();
+
+    // Create a random PeerId
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+    println!("Local peer id: {:?}", local_peer_id);
+
+    // Set up an encrypted TCP Transport over the Mplex and Yamux protocols
+    let transport = libp2p::build_development_transport(local_key.clone())?;
+
+    // Create a Gossipsub topic
+    let topic = Topic::new("test-net".into());
+
+    // Create a Swarm to manage peers and events
+    let mut swarm = {
+        // to set default parameters for gossipsub use:
+        // let gossipsub_config = gossipsub::GossipsubConfig::default();
+
+        // To content-address message, we can take the hash of message and use it as an ID.
+        let message_id_fn = |message: &GossipsubMessage| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            MessageId::from(s.finish().to_string())
+        };
+
+        // set custom gossipsub
+        let gossipsub_config = gossipsub::GossipsubConfigBuilder::new()
+            .heartbeat_interval(Duration::from_secs(10))
+            .message_id_fn(message_id_fn) // content-address messages. No two messages of the
+            //same content will be propagated.
+            .build();
+        // build a gossipsub network behaviour
+        let mut gossipsub =
+            gossipsub::Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config);
+        gossipsub.subscribe(topic.clone());
+        libp2p::Swarm::new(transport, gossipsub, local_peer_id)
+    };
+
+    // Listen on all interfaces and whatever port the OS assigns
+    libp2p::Swarm::listen_on(&mut swarm, "/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
+
+    // Reach out to another node if specified
+    if let Some(to_dial) = std::env::args().nth(1) {
+        let dialing = to_dial.clone();
+        match to_dial.parse() {
+            Ok(to_dial) => match libp2p::Swarm::dial_addr(&mut swarm, to_dial) {
+                Ok(_) => println!("Dialed {:?}", dialing),
+                Err(e) => println!("Dial {:?} failed: {:?}", dialing, e),
+            },
+            Err(err) => println!("Failed to parse address to dial: {:?}", err),
+        }
+    }
+
+    // Read full lines from stdin
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+
+    // Kick it off
+    let mut listening = false;
+    task::block_on(future::poll_fn(move |cx: &mut Context<'_>| {
+        loop {
+            if let Err(e) = match stdin.try_poll_next_unpin(cx)? {
+                Poll::Ready(Some(line)) => {
+                    let message = Message {
+                        uuid: "Text".to_string(),
+                        text: line.to_string(),
+                    };
+
+                    let text = serde_json::to_string(&message)?;
+
+                    swarm.publish(&topic, text.as_bytes())
+                }
+                Poll::Ready(None) => panic!("Stdin closed"),
+                Poll::Pending => break,
+            } {
+                println!("Publish error: {:?}", e);
+            }
+        }
+
+        loop {
+            match swarm.poll_next_unpin(cx) {
+                Poll::Ready(Some(gossip_event)) => match gossip_event {
+                    GossipsubEvent::Message(peer_id, id, message) => println!(
+                        "Got message: {} with id: {} from peer: {:?}",
+                        String::from_utf8_lossy(&message.data),
+                        id,
+                        peer_id
+                    ),
+                    _ => {}
+                },
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
+
+        if !listening {
+            for addr in libp2p::Swarm::listeners(&swarm) {
+                println!("Listening on {:?}", addr);
+                listening = true;
+            }
+        }
+
+        Poll::Pending
+    }))
 }
 
 fn gui() -> Result<(), Box<dyn Error>> {
     // Builder::from_env(Env::default().default_filter_or("info")).init();
+    let cfg = config::prompt();
     let mut rt = tokio::runtime::Runtime::new().unwrap();
 
     // Create two channels, one for the channel name
@@ -82,13 +264,13 @@ fn gui() -> Result<(), Box<dyn Error>> {
     // Create a random PeerId
     let local_key = identity::Keypair::generate_ed25519(); // Generate key
     let local_peer_id = PeerId::from(local_key.public()); // Generate the peer id using key
-                                                          // println!("Local peer id: {:?}", local_peer_id);
+    println!("Local peer id: {:?}", local_peer_id);
 
     // Set up an encrypted TCP Transport over the Mplex and Yamux protocols
     let transport = libp2p::build_development_transport(local_key.clone())?;
 
     // Create a Gossipsub topic
-    let topic = Topic::new("Global".into());
+    let topic = Topic::new("topic-test".into());
 
     // Create a Swarm to manage peers and events
     let mut swarm = {
@@ -118,25 +300,19 @@ fn gui() -> Result<(), Box<dyn Error>> {
     // Listen on all interfaces and whatever port the OS assigns
     libp2p::Swarm::listen_on(&mut swarm, "/ip4/0.0.0.0/tcp/0".parse().unwrap()).unwrap();
 
-    let cfg = config::prompt();
-
     // Reach out to another node if specified
     if let Some(to_dial) = cfg.get_network() {
         let dialing = to_dial.clone();
         match to_dial.parse() {
             Ok(to_dial) => match libp2p::Swarm::dial_addr(&mut swarm, to_dial) {
-                Ok(_) =>
-                    /* println!("Dialed {:?}", dialing)*/
-                    {}
-                Err(e) =>
-                    /*println!("Dial {:?} failed: {:?}", dialing, e)*/
-                    {}
+                Ok(_) => println!("Dialed {:?}", dialing),
+                Err(e) => println!("Dial {:?} failed: {:?}", dialing, e),
             },
-            Err(err) =>
-                /*println!("Failed to parse address to dial: {:?}", err)*/
-                {}
+            Err(err) => println!("Failed to parse address to dial: {:?}", err),
         }
     }
+
+    let mut listening = false;
 
     let sub_swarm = Arc::new(Mutex::new(swarm));
 
@@ -178,7 +354,6 @@ fn gui() -> Result<(), Box<dyn Error>> {
                             _ => {}
                         },
                         Poll::Ready(None) | Poll::Pending => {
-                            println!("Broke");
                             break;
                         }
                     }
